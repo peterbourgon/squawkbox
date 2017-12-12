@@ -17,7 +17,7 @@ func main() {
 	)
 	flag.Parse()
 	http.Handle("/v1/voice", handleSpeak(*sentence))
-	http.Handle("/v1/message", handleMessage(*sentence))
+	http.Handle("/v1/message", handleMessage())
 	log.Printf("listening on %s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, nil))
 }
