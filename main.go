@@ -32,7 +32,7 @@ func handleVoice() http.Handler {
 		}{
 			Say: fmt.Sprintf("Response %d. Generated %s UTC.",
 				atomic.LoadUint64(&globalRequestCounter),
-				time.Now().UTC().Format("2006 01 02 at 15:04:05"),
+				time.Now().UTC().Format("Monday 02 January 15 04 05"),
 			),
 		})
 	})
