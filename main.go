@@ -14,24 +14,26 @@ import (
 
 func main() {
 	var (
-		addr     = flag.String("addr", ":6175", "listen address")
-		sentence = flag.String("sentence", "At MegaCorp, my voice is my password.", "sentence for /speak route")
+		addr = flag.String("addr", ":6175", "listen address")
 	)
 	flag.Parse()
-	http.Handle("/v1/voice", logging(handleSpeak(*sentence)))
+	http.Handle("/v1/voice", logging(handleVoice()))
 	http.Handle("/v1/message", logging(handleMessage()))
 	log.Printf("listening on %s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, nil))
 }
 
-func handleSpeak(sentence string) http.Handler {
+func handleVoice() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml")
 		xml.NewEncoder(w).Encode(struct {
 			XMLName xml.Name `xml:"Response"`
 			Say     string   `xml:",omitempty"`
 		}{
-			Say: sentence,
+			Say: fmt.Sprintf("Response %d. Generated %s UTC.",
+				atomic.LoadUint64(&globalRequestCounter),
+				time.Now().UTC().Format("2006 01 02 at 15:04:05"),
+			),
 		})
 	})
 }
