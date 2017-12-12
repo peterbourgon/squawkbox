@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/xml"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 )
@@ -36,5 +37,5 @@ func handleSpeak(sentence string) http.Handler {
 func handleMessage() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "OK")
-	}
+	})
 }
