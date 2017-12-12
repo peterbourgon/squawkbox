@@ -30,9 +30,9 @@ func handleVoice() http.Handler {
 			XMLName xml.Name `xml:"Response"`
 			Say     string   `xml:",omitempty"`
 		}{
-			Say: fmt.Sprintf("Response %d. Generated %s UTC.",
+			Say: fmt.Sprintf("Response %d. Generated %s.",
 				atomic.LoadUint64(&globalRequestCounter),
-				time.Now().UTC().Format("Monday 02 January 15 04 05"),
+				time.Now().UTC().Format("Monday 02 January, at 15, 04, 05"),
 			),
 		})
 	})
