@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/xml"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -98,26 +97,11 @@ func main() {
 	log.Printf("%s: saving recordings here", *recordings)
 
 	http.Handle("/v1/greeting", logging(handleGreeting()))
-	http.Handle("/v1/bypass", logging(handleBypass(bypass)))
+	http.Handle("/v1/bypass", logging(handleBypass(bypass, forward)))
 	http.Handle("/v1/forward", logging(handleForward(forward)))
 	http.Handle("/v1/recordings/", logging(handleRecordings(*recordings, "/v1/recordings", user, pass)))
 	log.Printf("listening on %s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, nil))
-}
-
-func handleVoice() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/xml")
-		xml.NewEncoder(w).Encode(struct {
-			XMLName xml.Name `xml:"Response"`
-			Say     string   `xml:",omitempty"`
-		}{
-			Say: fmt.Sprintf("Response %d. Generated %s.",
-				atomic.LoadUint64(&globalRequestCounter),
-				time.Now().UTC().Format("Monday 02 January, at 15, 04, 05"),
-			),
-		})
-	})
 }
 
 func handleGreeting() http.Handler {
@@ -133,18 +117,19 @@ func handleGreeting() http.Handler {
 	})
 }
 
-func handleBypass(bypass string) http.Handler {
+func handleBypass(bypass, forward string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		digits := r.FormValue("Digits")
-		if digits == "" {
-			digits = "empty"
+		if bypass == "" || digits != bypass {
+			handleForward(forward).ServeHTTP(w, r)
+			return
 		}
 		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?> 
 			<Response> 
-				<Say>You entered the bypass code: %s. Thanks! Bye.</Say>
+				<Say>Bypass mode enabled. Goodbye.</Say>
 				<Hangup />
 			</Response>
-		`, digits)
+		`)
 	})
 }
 
