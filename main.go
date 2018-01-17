@@ -1,252 +1,153 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
-	"log"
+	"math/rand"
+	"net"
 	"net/http"
 	"os"
-	"path/filepath"
-	"strings"
-	"sync/atomic"
+	"text/tabwriter"
 	"time"
+
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
+	"github.com/oklog/run"
 )
 
-// https://www.twilio.com/blog/2014/10/making-and-receiving-phone-calls-with-golang.html
-
 func main() {
+	fs := flag.NewFlagSet("squawkbox", flag.ExitOnError)
 	var (
-		addr        = flag.String("addr", ":6175", "listen address")
-		authFile    = flag.String("auth", "", "file containing HTTP Basic Auth user:pass")
-		bypassFile  = flag.String("bypass", "", "file containing secret bypass code (optional)")
-		forwardFile = flag.String("forward", "", "file containing forwarding phone number")
-		recordings  = flag.String("recordings", "", "path to save recordings")
+		addr        = fs.String("addr", "127.0.0.1:9176", "listen address")
+		debug       = fs.Bool("debug", false, "debug logging")
+		authfile    = fs.String("authfile", "", "file containing HTTP BasicAuth user:pass:realm")
+		forwardfile = fs.String("forwardfile", "", "file containing number to forward to")
+		greeting    = fs.String("greeting", "Hello; enter code, or wait for connection.", "greeting text")
+		forward     = fs.String("forward", "Connecting you now.", "forward text")
+		noResponse  = fs.String("noresponse", "Nobody picked up. Goodbye!", "no response text")
 	)
-	flag.Parse()
-
-	var user, pass string
-	if *authFile != "" {
-		buf, err := ioutil.ReadFile(*authFile)
-		if err != nil {
-			log.Fatal(err)
-		}
-		str := strings.TrimSpace(string(buf))
-		toks := strings.SplitN(str, ":", 2)
-		if len(toks) != 2 {
-			log.Fatalf("%s: must be in format: user:pass", *authFile)
-		}
-		user, pass = toks[0], toks[1]
-		if user == "" || pass == "" {
-			log.Fatalf("%s: empty user or pass", *authFile)
-		}
-		log.Printf("%s: valid auth received", *authFile)
-	} else {
-		log.Fatal("no auth file specified, cannot start up")
+	fs.Usage = usageFor(fs, "squawkbox [flags]")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
 	}
 
-	var forward string
-	if *forwardFile != "" {
-		buf, err := ioutil.ReadFile(*forwardFile)
-		if err != nil {
-			log.Fatal(err)
+	var loglevel level.Option
+	{
+		loglevel = level.AllowInfo()
+		if *debug {
+			loglevel = level.AllowDebug()
 		}
-		forward = string(bytes.TrimSpace(buf))
-		if len(forward) <= 0 {
-			log.Fatalf("%s: forwarding number must be nonempty", *forwardFile)
-		}
-		if !isNumeric(forward) {
-			log.Fatalf("%s: forwarding number must be numeric", *forwardFile)
-		}
-		log.Printf("%s: valid forwarding number received", *forwardFile)
-	} else {
-		log.Fatal("no forward file specified, cannot start up")
 	}
 
-	var bypass string
-	if *bypassFile != "" {
-		buf, err := ioutil.ReadFile(*bypassFile)
-		if err != nil {
-			log.Fatal(err)
-		}
-		bypass = string(bytes.TrimSpace(buf))
-		if len(bypass) <= 0 {
-			log.Fatalf("%s: bypass code must be nonempty", *bypassFile)
-		}
-		if !isNumeric(bypass) {
-			log.Fatalf("%s: bypass code must be numeric", *bypassFile)
-		}
-		log.Printf("%s: valid bypass code received", *bypassFile)
-	} else {
-		log.Printf("no bypass file specified, bypass code not enabled")
+	var logger log.Logger
+	{
+		logger = log.NewLogfmtLogger(os.Stdout)
+		logger = log.With(logger, "ts", log.DefaultTimestampUTC())
+		logger = log.With(logger, "caller", log.Caller(5))
+		logger = level.NewFilter(logger, loglevel)
 	}
 
-	if fi, err := os.Stat(*recordings); err != nil {
-		log.Fatalf("recordings directory: %v", err)
-	} else if !fi.IsDir() {
-		log.Fatalf("recordings directory: %s isn't a directory", *recordings)
+	var eventLog *eventLog
+	{
+		entropy := rand.New(rand.NewSource(time.Now().UnixNano()))
+		eventLog = newEventLog(entropy)
 	}
-	testfile := filepath.Join(*recordings, "make-sure-writes-work")
-	if err := ioutil.WriteFile(testfile, []byte{}, 0600); err != nil {
-		log.Fatalf("recordings directory: %v", err)
-	}
-	if err := os.Remove(testfile); err != nil {
-		log.Fatalf("recordings directory: %v", err)
-	}
-	log.Printf("%s: saving recordings here", *recordings)
 
-	http.Handle("/v1/greeting", logging(handleGreeting()))
-	http.Handle("/v1/bypass", logging(handleBypass(bypass, forward)))
-	http.Handle("/v1/forward", logging(handleForward(forward)))
-	http.Handle("/v1/recordings/", logging(handleRecordings(*recordings, "/v1/recordings", user, pass)))
-	log.Printf("listening on %s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, nil))
-}
-
-func handleGreeting() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?> 
-			<Response> 
-				<Gather input="dtmf" action="/v1/bypass" timeout="5" finishOnKey="#">
-					<Say>Hello; enter code, or wait for connection.</Say>
-				</Gather>
-				<Redirect>/v1/forward</Redirect>
-			</Response>
-		`)
-	})
-}
-
-func handleBypass(bypass, forward string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		digits := r.FormValue("Digits")
-		if bypass == "" || digits != bypass {
-			handleForward(forward).ServeHTTP(w, r)
-			return
-		}
-		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?> 
-			<Response> 
-				<Say>Bypass mode enabled. Goodbye.</Say>
-				<Hangup />
-			</Response>
-		`)
-	})
-}
-
-func handleForward(forward string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?> 
-			<Response> 
-				<Say>OK, connecting you now.</Say>
-				<Dial record="record-from-ringing" recordingStatusCallback="/v1/recordings" recordingStatusCallbackMethod="POST">
-					<Number>%s</Number>
-				</Dial>
-				<Say>Looks like there's no response. Sorry!</Say>
-				<Hangup />
-			</Response>
-		`, forward)
-	})
-}
-
-func handleRecordings(dir, prefix, user, pass string) http.Handler {
-	fs := http.FileServer(http.Dir(dir))
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.ParseForm()
-		var (
-			url = r.FormValue("RecordingUrl")
-			sid = r.FormValue("RecordingSid")
-			dur = r.FormValue("RecordingDuration")
-		)
-		if url == "" {
-			handleListRecordings(user, pass, http.StripPrefix(prefix, fs)).ServeHTTP(w, r)
-		} else {
-			handlePostRecording(dir, url, sid, dur).ServeHTTP(w, r)
-		}
-	})
-}
-
-func handleListRecordings(user, pass string, fs http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requser, reqpass, _ := r.BasicAuth()
-		if requser == user && reqpass == pass {
-			fs.ServeHTTP(w, r)
-			return
-		}
-
-		w.Header().Set("WWW-Authenticate", `Basic realm="Field recordings"`)
-		w.WriteHeader(401)
-		fmt.Fprintln(w, "401 Unauthorized")
-	})
-}
-
-func handlePostRecording(dir, url, sid, dur string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		resp, err := http.Get(url)
-		if err != nil {
-			log.Printf("POST Recording: %v", err)
-			return
-		}
-		buf, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("POST Recording: %v", err)
-			return
-		}
-		filename := time.Now().Format("2006-01-02-15-04-05") + "-" + dur + "sec" + "-" + sid + ".wav"
-		if err := ioutil.WriteFile(filepath.Join(dir, filename), buf, 0600); err != nil {
-			log.Printf("POST Recording: %v", err)
-			return
-		}
-	})
-}
-
-var globalRequestCounter = uint64(0)
-
-func logging(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var (
-			iw = &interceptingWriter{w, http.StatusOK}
-			id = incr(&globalRequestCounter)
-		)
-		defer func(begin time.Time) {
-			log.Printf("[%d] %s: %s %s (%dB)", id, r.RemoteAddr, r.Method, r.URL, r.ContentLength)
-			for k, v := range r.Header {
-				log.Printf("[%d] Header: %s: %s", id, k, v)
+	var authenticate func(http.Handler) http.Handler
+	{
+		if *authfile != "" {
+			realm, user, pass, err := parseAuthFile(*authfile)
+			if err != nil {
+				level.Error(logger).Log("err", err)
+				os.Exit(1)
 			}
-			log.Printf("[%d] %d (%s)", id, iw.code, time.Since(begin))
-		}(time.Now())
-
-		next.ServeHTTP(iw, r)
-	})
-}
-
-type interceptingWriter struct {
-	http.ResponseWriter
-	code int
-}
-
-func (iw *interceptingWriter) WriteHeader(code int) {
-	iw.code = code
-	iw.ResponseWriter.WriteHeader(code)
-}
-
-func incr(addr *uint64) uint64 {
-	for {
-		prev := atomic.LoadUint64(addr)
-		next := prev + 1
-		if atomic.CompareAndSwapUint64(addr, prev, next) {
-			return next
+			authenticate = func(next http.Handler) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					requser, reqpass, _ := r.BasicAuth()
+					if requser != user || reqpass != pass {
+						w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, realm))
+						w.WriteHeader(http.StatusUnauthorized)
+						fmt.Fprintln(w, http.StatusText(http.StatusUnauthorized))
+						return
+					}
+					next.ServeHTTP(w, r)
+				})
+			}
+			level.Debug(logger).Log("basic_auth", "enabled")
+		} else {
+			authenticate = func(next http.Handler) http.Handler { return next }
+			level.Warn(logger).Log("basic_auth", "disabled")
 		}
 	}
-}
 
-func isNumeric(s string) bool {
-	for _, r := range s {
-		switch r {
-		case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
-			continue
-		default:
-			return false
+	var forwardNumber string
+	{
+		var err error
+		forwardNumber, err = parseForwardFile(*forwardfile)
+		if err != nil {
+			level.Error(logger).Log("err", err)
+			os.Exit(1)
 		}
 	}
-	return true
+
+	var codeManager *codeManager
+	{
+		codeManager = newCodeManager()
+	}
+
+	var recordingManager *recordingManager
+	{
+		recordingManager = newRecordingManager()
+	}
+
+	api := &api{
+		EventLog:         eventLog,
+		Authenticate:     authenticate,
+		GreetingText:     *greeting,
+		ForwardText:      *forward,
+		ForwardNumber:    forwardNumber,
+		NoResponseText:   *noResponse,
+		CodeManager:      codeManager,
+		RecordingManager: recordingManager,
+	}
+
+	server := http.Server{
+		Handler: api,
+	}
+
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		level.Error(logger).Log("module", "main", "err", err)
+		os.Exit(1)
+	}
+
+	var g run.Group
+	{
+		g.Add(func() error {
+			level.Info(logger).Log("addr", *addr)
+			return server.Serve(ln)
+		}, func(error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			server.Shutdown(ctx)
+		})
+	}
+	level.Info(logger).Log("exit", g.Run())
+}
+
+func usageFor(fs *flag.FlagSet, short string) func() {
+	return func() {
+		fmt.Fprintf(os.Stderr, "USAGE\n")
+		fmt.Fprintf(os.Stderr, "  %s\n", short)
+		fmt.Fprintf(os.Stderr, "\n")
+		fmt.Fprintf(os.Stderr, "FLAGS\n")
+		w := tabwriter.NewWriter(os.Stderr, 0, 2, 2, ' ', 0)
+		fs.VisitAll(func(f *flag.Flag) {
+			fmt.Fprintf(w, "\t-%s %s\t%s\n", f.Name, f.DefValue, f.Usage)
+		})
+		w.Flush()
+		fmt.Fprintf(os.Stderr, "\n")
+	}
 }
