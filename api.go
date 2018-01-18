@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
 )
 
@@ -51,34 +54,23 @@ func (a *api) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 	r = r.WithContext(newctx)
 
-	// Service the request.
-	method, path := r.Method, r.URL.Path
-	switch {
-	case method == "GET" && path == "/v1/greeting":
-		a.handleGreeting(w, r)
-	case method == "GET" && path == "/v1/bypass":
-		a.handleBypass(w, r)
-	case method == "GET" && path == "/v1/forward":
-		a.handleForward(w, r)
-	case method == "GET" && path == "/v1/recordings":
-		a.handlePostRecording(w, r)
+	// Build the route muxer.
+	router := mux.NewRouter()
+	router.StrictSlash(true)
+	router.Methods("GET").Path("/v1/greeting").HandlerFunc(a.handleGreeting)
+	router.Methods("GET").Path("/v1/bypass").HandlerFunc(a.handleBypass)
+	router.Methods("GET").Path("/v1/forward").HandlerFunc(a.handleForward)
+	router.Methods("GET").Path("/v1/recordings").HandlerFunc(a.handlePostRecording)
+	router.Methods("GET").Path("/").Handler(a.Authenticate(http.HandlerFunc(a.handleGetIndex)))
+	router.Methods("GET").Path("/events").Handler(a.Authenticate(http.HandlerFunc(a.handleGetEvents)))
+	router.Methods("GET").Path("/events/{id}").Handler(a.Authenticate(http.HandlerFunc(a.handleGetEvent)))
+	router.Methods("GET").Path("/codes").Handler(a.Authenticate(http.HandlerFunc(a.handleGetCodes)))
+	router.Methods("POST").Path("/codes").Handler(a.Authenticate(http.HandlerFunc(a.handlePostCodes)))
+	router.Methods("POST").Path("/codes/{id}").Handler(a.Authenticate(http.HandlerFunc(a.handleDeleteCodes)))
+	router.Methods("GET").Path("/recordings").Handler(a.Authenticate(http.HandlerFunc(a.handleGetRecordings)))
 
-	case method == "GET" && path == "/":
-		a.Authenticate(http.HandlerFunc(a.handleGetIndex)).ServeHTTP(w, r)
-	case method == "GET" && path == "/events":
-		a.Authenticate(http.HandlerFunc(a.handleGetEvents)).ServeHTTP(w, r)
-	case method == "GET" && path == "/codes":
-		a.Authenticate(http.HandlerFunc(a.handleGetCodes)).ServeHTTP(w, r)
-	case method == "POST" && path == "/codes":
-		a.Authenticate(http.HandlerFunc(a.handlePostCodes)).ServeHTTP(w, r)
-	case method == "DELETE" && path == "/codes":
-		a.Authenticate(http.HandlerFunc(a.handleDeleteCodes)).ServeHTTP(w, r)
-	case method == "GET" && path == "/recordings":
-		a.Authenticate(http.HandlerFunc(a.handleGetRecordings)).ServeHTTP(w, r)
-
-	default:
-		http.NotFound(w, r)
-	}
+	// Serve the request.
+	router.ServeHTTP(w, r)
 
 	// Add final event data.
 	data.addData(
@@ -86,12 +78,22 @@ func (a *api) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"HTTP Status Code", fmt.Sprint(iw.code)+" "+http.StatusText(iw.code),
 	)
 
-	// Log the event.
+	// Extract the Kind.
 	kind := eventKind(data[dataKeyKind])
 	if kind == "" {
 		kind = eventKindGenericHTTPRequest
 	}
-	a.EventLog.logEvent(kind, data)
+	delete(data, dataKeyKind)
+
+	// Log the event.
+	switch kind {
+	case eventKindAdminIndex:
+	case eventKindAdminListCodes, eventKindAdminListEvents, eventKindAdminListRecordings:
+	case eventKindAdminGetEvent, eventKindAdminGetRecording:
+		// Don't log these ones.
+	default:
+		a.EventLog.logEvent(kind, data)
+	}
 }
 
 func (a *api) handleGreeting(w http.ResponseWriter, r *http.Request) {
@@ -221,17 +223,91 @@ func (a *api) handleGetEvents(w http.ResponseWriter, r *http.Request) {
 	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
 	dc.addData(dataKeyKind, string(eventKindAdminListEvents))
 
+	r.ParseForm()
 	var (
 		from     = r.FormValue("from")
 		countStr = r.FormValue("count")
 		count, _ = strconv.Atoi(countStr)
+		events   = a.EventLog.listEvents(from, count)
 	)
-	buf, err := json.MarshalIndent(a.EventLog.listEvents(from, count), "", "    ")
-	if err != nil {
-		http.Error(w, errors.Wrap(err, "encoding events").Error(), http.StatusInternalServerError)
+
+	type templateEvent struct {
+		Color   string
+		ULID    string
+		Time    string
+		Kind    string
+		Details []string
+	}
+
+	templateEvents := make([]templateEvent, len(events))
+	for i, event := range events {
+		generalDetails, _ := parseDetails(event.Data)
+		templateEvents[i] = templateEvent{
+			Color:   colorFor(event.Kind),
+			ULID:    event.ULID,
+			Time:    event.HumanTime,
+			Kind:    string(event.Kind),
+			Details: generalDetails,
+		}
+	}
+
+	var nextPage string
+	if len(templateEvents) > 0 {
+		nextPage = templateEvents[len(templateEvents)-1].ULID
+	}
+
+	aggregate := headerTemplate + eventsTemplate + footerTemplate
+	if err := template.Must(template.New("events").Parse(aggregate)).Execute(w, struct {
+		Events   []templateEvent
+		NextPage string
+	}{
+		Events:   templateEvents,
+		NextPage: nextPage,
+	}); err != nil {
+		http.Error(w, errors.Wrap(err, "executing events template").Error(), http.StatusInternalServerError)
 		return
 	}
-	w.Write(buf)
+}
+
+func (a *api) handleGetEvent(w http.ResponseWriter, r *http.Request) {
+	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
+	dc.addData(dataKeyKind, string(eventKindAdminGetEvent))
+
+	id := mux.Vars(r)["id"]
+	if id == "" {
+		http.Error(w, "no event ID provided; bad routing", http.StatusInternalServerError)
+		return
+	}
+
+	ev, ok := a.EventLog.getEvent(id)
+	if !ok {
+		http.Error(w, fmt.Sprintf("event %s not found", id), http.StatusNotFound)
+		return
+	}
+
+	generalDetails, httpDetails := parseDetails(ev.Data)
+
+	aggregate := headerTemplate + eventTemplate + footerTemplate
+	if err := template.Must(template.New("event").Parse(aggregate)).Execute(w, struct {
+		Color   string
+		ULID    string
+		Time    string
+		UTC     string
+		Kind    string
+		Details []string
+		HTTP    []string
+	}{
+		Color:   colorFor(ev.Kind),
+		ULID:    ev.ULID,
+		Time:    ev.HumanTime,
+		UTC:     ev.Timestamp,
+		Kind:    string(ev.Kind),
+		Details: generalDetails,
+		HTTP:    httpDetails,
+	}); err != nil {
+		http.Error(w, errors.Wrap(err, "executing event template").Error(), http.StatusInternalServerError)
+		return
+	}
 }
 
 func (a *api) handleGetCodes(w http.ResponseWriter, r *http.Request) {
@@ -239,12 +315,23 @@ func (a *api) handleGetCodes(w http.ResponseWriter, r *http.Request) {
 	dc.addData(dataKeyKind, string(eventKindAdminListCodes))
 
 	codes := a.CodeManager.listCodes()
-	buf, err := json.MarshalIndent(codes, "", "    ")
-	if err != nil {
-		http.Error(w, errors.Wrap(err, "encoding current codes").Error(), http.StatusInternalServerError)
+	flat := make([]bypassCode, 0, len(codes))
+	for _, code := range codes {
+		if t, err := time.Parse(time.RFC3339, code.ExpiresAt); err == nil {
+			code.ExpiresAt = t.Format(myDate) // for display
+		}
+		flat = append(flat, code)
+	}
+
+	aggregate := headerTemplate + codesTemplate + footerTemplate
+	if err := template.Must(template.New("event").Parse(aggregate)).Execute(w, struct {
+		Codes []bypassCode
+	}{
+		Codes: flat,
+	}); err != nil {
+		http.Error(w, errors.Wrap(err, "executing codes template").Error(), http.StatusInternalServerError)
 		return
 	}
-	w.Write(buf)
 }
 
 func (a *api) handlePostCodes(w http.ResponseWriter, r *http.Request) {
@@ -255,6 +342,7 @@ func (a *api) handlePostCodes(w http.ResponseWriter, r *http.Request) {
 	var (
 		code         = r.FormValue("code")
 		useCountStr  = r.FormValue("use_count")
+		expiresIn    = r.FormValue("expires_in")
 		expiresAtStr = r.FormValue("expires_at")
 	)
 	if code == "" {
@@ -265,11 +353,29 @@ func (a *api) handlePostCodes(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "code is non-numeric", http.StatusBadRequest)
 		return
 	}
-	expiresAt, err := time.Parse(time.RFC3339, expiresAtStr)
-	if err != nil {
-		http.Error(w, "expires_at not specified", http.StatusBadRequest)
+
+	var expiresAt time.Time
+	if expiresIn != "" {
+		d, err := time.ParseDuration(expiresIn)
+		if err != nil {
+			http.Error(w, "expires_in is invalid", http.StatusBadRequest)
+			return
+		}
+		expiresAt = time.Now().Add(d)
+	}
+	if expiresAtStr != "" {
+		t, err := time.Parse(time.RFC3339, expiresAtStr)
+		if err != nil {
+			http.Error(w, "expires_at is invalid", http.StatusBadRequest)
+			return
+		}
+		expiresAt = t
+	}
+	if expiresAt.IsZero() {
+		http.Error(w, "either expires_in or expires_at must be specified", http.StatusBadRequest)
 		return
 	}
+
 	useCount, err := strconv.Atoi(useCountStr)
 	if err != nil {
 		http.Error(w, errors.Wrap(err, "parsing use_count as integer").Error(), http.StatusBadRequest)
@@ -290,7 +396,9 @@ func (a *api) handlePostCodes(w http.ResponseWriter, r *http.Request) {
 		dataKeyBypassCodeUseCount, fmt.Sprint(useCount),
 		dataKeyBypassCodeExpiresAt, expiring,
 	)
-	fmt.Fprintf(w, "Added code %s, use count %d, expiring on %s -- OK\n", code, useCount, expiring)
+
+	r.Method = "GET"
+	http.Redirect(w, r, "/codes", http.StatusSeeOther)
 }
 
 func (a *api) handleDeleteCodes(w http.ResponseWriter, r *http.Request) {
@@ -298,7 +406,12 @@ func (a *api) handleDeleteCodes(w http.ResponseWriter, r *http.Request) {
 	dc.addData(dataKeyKind, string(eventKindAdminRevokeCode))
 
 	r.ParseForm()
-	code := r.FormValue("code")
+	if r.FormValue("delete") == "" {
+		http.Error(w, "POST code without delete param", http.StatusBadRequest)
+		return
+	}
+
+	code := mux.Vars(r)["id"]
 	if code == "" {
 		http.Error(w, "code not specified", http.StatusBadRequest)
 		return
@@ -308,7 +421,9 @@ func (a *api) handleDeleteCodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dc.addData(dataKeyBypassCode, code)
-	fmt.Fprintf(w, "Revoked code %s -- OK\n", code)
+
+	r.Method = "GET"
+	http.Redirect(w, r, "/codes", http.StatusSeeOther)
 }
 
 type interceptingWriter struct {
@@ -358,3 +473,34 @@ var (
 	dataValueSuccess = "SUCCESS"
 	dataValueFailed  = "FAILED"
 )
+
+func colorFor(kind eventKind) string {
+	switch kind {
+	case eventKindAdminCreateCode, eventKindAdminRevokeCode, eventKindAdminGetRecording:
+		return "orange"
+	case eventKindDoorbellGreeting, eventKindDoorbellForward, eventKindDoorbellRecording:
+		return "lightblue"
+	case eventKindDoorbellBypass:
+		return "red"
+	default:
+		return "white"
+	}
+}
+
+func parseDetails(data map[string]string) (general, http []string) {
+	for k, v := range data {
+		var (
+			httpPrefix = strings.HasPrefix(k, "HTTP ")
+			statusCode = k == "HTTP Status Code"
+		)
+		if httpPrefix {
+			http = append(http, fmt.Sprintf("%s: %s", strings.TrimPrefix(k, "HTTP "), v))
+		}
+		if !httpPrefix || statusCode {
+			general = append(general, fmt.Sprintf("%s: %s", k, v))
+		}
+	}
+	sort.Strings(general)
+	sort.Strings(http)
+	return general, http
+}

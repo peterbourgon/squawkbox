@@ -8,6 +8,8 @@ import (
 	"github.com/oklog/ulid"
 )
 
+const myDate = "Monday 02 Jan 2006 15:04:05 MST"
+
 type eventLog struct {
 	mtx     sync.Mutex
 	entropy io.Reader
@@ -32,6 +34,7 @@ const (
 
 	eventKindAdminIndex          eventKind = "Admin index"
 	eventKindAdminListEvents     eventKind = "Admin list events"
+	eventKindAdminGetEvent       eventKind = "Admin get event"
 	eventKindAdminListCodes      eventKind = "Admin list codes"
 	eventKindAdminCreateCode     eventKind = "Admin create code"
 	eventKindAdminRevokeCode     eventKind = "Admin revoke code"
@@ -58,7 +61,7 @@ func (el *eventLog) logEvent(kind eventKind, data map[string]string) string {
 	el.events = append([]event{event{
 		ULID:      ulid,
 		Timestamp: now.UTC().Format(time.RFC3339),
-		HumanTime: now.Format("Monday 02 Jan 2006 15:04:05 MST"),
+		HumanTime: now.Format(myDate),
 		Kind:      kind,
 		Data:      data,
 	}}, el.events...)
@@ -71,7 +74,7 @@ func (el *eventLog) listEvents(fromULID string, count int) []event {
 	}
 	from := ulid.MustParse(fromULID)
 	if count <= 0 {
-		count = 10
+		count = 100
 	}
 	el.mtx.Lock()
 	defer el.mtx.Unlock()
@@ -86,4 +89,15 @@ func (el *eventLog) listEvents(fromULID string, count int) []event {
 		}
 	}
 	return res
+}
+
+func (el *eventLog) getEvent(ulid string) (event, bool) {
+	el.mtx.Lock()
+	defer el.mtx.Unlock()
+	for _, e := range el.events {
+		if e.ULID == ulid {
+			return e, true
+		}
+	}
+	return event{}, false
 }
