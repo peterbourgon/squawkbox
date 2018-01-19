@@ -36,6 +36,5 @@ mkdir recordings
 squawkbox \
   -authfile basic_auth.txt \
   -forwardfile forward_number.txt \
-  -codesfile 
   -recordingsdir recordings
 ```
