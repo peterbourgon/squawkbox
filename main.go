@@ -19,13 +19,16 @@ import (
 func main() {
 	fs := flag.NewFlagSet("squawkbox", flag.ExitOnError)
 	var (
-		addr        = fs.String("addr", "127.0.0.1:9176", "listen address")
-		debug       = fs.Bool("debug", false, "debug logging")
-		authfile    = fs.String("authfile", "", "file containing HTTP BasicAuth user:pass:realm")
-		forwardfile = fs.String("forwardfile", "", "file containing number to forward to")
-		greeting    = fs.String("greeting", "Hello; enter code, or wait for connection.", "greeting text")
-		forward     = fs.String("forward", "Connecting you now.", "forward text")
-		noResponse  = fs.String("noresponse", "Nobody picked up. Goodbye!", "no response text")
+		addr          = fs.String("addr", "127.0.0.1:9176", "listen address")
+		debug         = fs.Bool("debug", false, "debug logging")
+		authfile      = fs.String("authfile", "", "file containing HTTP BasicAuth user:pass:realm")
+		forwardfile   = fs.String("forwardfile", "", "file containing number to forward to")
+		greeting      = fs.String("greeting", "Hello; enter code, or wait for connection.", "greeting text")
+		forward       = fs.String("forward", "Connecting you now.", "forward text")
+		noResponse    = fs.String("noresponse", "Nobody picked up. Goodbye!", "no response text")
+		codesfile     = fs.String("codesfile", "codes.dat", "file to store bypass codes")
+		eventsfile    = fs.String("eventsfile", "events.dat", "file to store audit events")
+		recordingsdir = fs.String("recordingsdir", "recordings", "directory containing saved recordings")
 	)
 	fs.Usage = usageFor(fs, "squawkbox [flags]")
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -51,8 +54,13 @@ func main() {
 
 	var eventLog *eventLog
 	{
+		var err error
 		entropy := rand.New(rand.NewSource(time.Now().UnixNano()))
-		eventLog = newEventLog(entropy)
+		eventLog, err = newEventLog(*eventsfile, entropy)
+		if err != nil {
+			level.Error(logger).Log("err", err)
+			os.Exit(1)
+		}
 	}
 
 	var authenticate func(http.Handler) http.Handler
@@ -94,12 +102,17 @@ func main() {
 
 	var codeManager *codeManager
 	{
-		codeManager = newCodeManager()
+		var err error
+		codeManager, err = newCodeManager(*codesfile)
+		if err != nil {
+			level.Error(logger).Log("err", err)
+			os.Exit(1)
+		}
 	}
 
 	var recordingManager *recordingManager
 	{
-		recordingManager = newRecordingManager()
+		recordingManager = newRecordingManager(*recordingsdir)
 	}
 
 	api := &api{

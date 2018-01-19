@@ -89,7 +89,7 @@ func (a *api) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch kind {
 	case eventKindAdminIndex:
 	case eventKindAdminListCodes, eventKindAdminListEvents, eventKindAdminListRecordings:
-	case eventKindAdminGetEvent:
+	case eventKindAdminGetEvent, eventKindAdminGetRecording:
 		// Don't log these ones.
 	default:
 		a.EventLog.logEvent(kind, data)
@@ -122,7 +122,7 @@ func (a *api) handleBypass(w http.ResponseWriter, r *http.Request) {
 		dc.addData(dataKeyBypassResult, dataValueSuccess)
 		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?> 
 			<Response> 
-				<Play digits="w9"></Play>
+				<Play digits="w9w"></Play>
 				<Hangup />
 			</Response>
 		`)
@@ -245,8 +245,13 @@ func (a *api) handleGetEvents(w http.ResponseWriter, r *http.Request) {
 		from     = r.FormValue("from")
 		countStr = r.FormValue("count")
 		count, _ = strconv.Atoi(countStr)
-		events   = a.EventLog.listEvents(from, count)
 	)
+
+	events, err := a.EventLog.listEvents(from, count)
+	if err != nil {
+		http.Error(w, errors.Wrap(err, "couldn't list events").Error(), http.StatusInternalServerError)
+		return
+	}
 
 	type templateEvent struct {
 		Color   string
@@ -296,9 +301,9 @@ func (a *api) handleGetEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ev, ok := a.EventLog.getEvent(id)
-	if !ok {
-		http.Error(w, fmt.Sprintf("event %s not found", id), http.StatusNotFound)
+	ev, err := a.EventLog.getEvent(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
 
@@ -331,7 +336,12 @@ func (a *api) handleGetCodes(w http.ResponseWriter, r *http.Request) {
 	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
 	dc.addData(dataKeyKind, string(eventKindAdminListCodes))
 
-	codes := a.CodeManager.listCodes()
+	codes, err := a.CodeManager.listCodes()
+	if err != nil {
+		http.Error(w, errors.Wrap(err, "listing codes").Error(), http.StatusInternalServerError)
+		return
+	}
+
 	flat := make([]bypassCode, 0, len(codes))
 	for _, code := range codes {
 		if t, err := time.Parse(time.RFC3339, code.ExpiresAt); err == nil {
