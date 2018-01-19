@@ -27,8 +27,8 @@ func main() {
 		forward       = fs.String("forward", "Connecting you now.", "forward text")
 		noResponse    = fs.String("noresponse", "Nobody picked up. Goodbye!", "no response text")
 		codesfile     = fs.String("codesfile", "codes.dat", "file to store bypass codes")
-		eventsfile    = fs.String("eventsfile", "events.dat", "file to store audit events")
-		recordingsdir = fs.String("recordingsdir", "recordings", "directory containing saved recordings")
+		eventsfile    = fs.String("eventsfile", "events.dat", "file to store event log")
+		recordingsdir = fs.String("recordingsdir", "", "directory containing saved recordings")
 	)
 	fs.Usage = usageFor(fs, "squawkbox [flags]")
 	if err := fs.Parse(os.Args[1:]); err != nil {
