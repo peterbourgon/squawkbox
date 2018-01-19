@@ -16,7 +16,8 @@ td, th {
 <div class="header">
 <strong>Squawkbox</strong> •
 <a href="/events">Audit log</a> ·
-<a href="/codes">Bypass codes</a>
+<a href="/codes">Bypass codes</a> ·
+<a href="/recordings">Recordings</a>
 </div>
 <br/>`
 
@@ -109,6 +110,14 @@ const codesTemplate = `
 </tr>
 {{ end }}
 </table>`
+
+const recordingsTemplate = `<ul>
+{{ if .Recordings }}{{ range .Recordings }}
+<li><a href="/recordings/{{ . }}">{{ . }}</a></li>
+{{ end }}{{ else }}
+<li>(No recordings!)</li>
+{{ end }}
+</ul>`
 
 const footerTemplate = `</body>
 </html>`

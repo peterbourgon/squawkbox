@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -57,10 +56,10 @@ func (a *api) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Build the route muxer.
 	router := mux.NewRouter()
 	router.StrictSlash(true)
-	router.Methods("GET").Path("/v1/greeting").HandlerFunc(a.handleGreeting)
-	router.Methods("GET").Path("/v1/bypass").HandlerFunc(a.handleBypass)
-	router.Methods("GET").Path("/v1/forward").HandlerFunc(a.handleForward)
-	router.Methods("GET").Path("/v1/recordings").HandlerFunc(a.handlePostRecording)
+	router.Methods("POST").Path("/v1/greeting").HandlerFunc(a.handleGreeting)
+	router.Methods("POST").Path("/v1/bypass").HandlerFunc(a.handleBypass)
+	router.Methods("POST").Path("/v1/forward").HandlerFunc(a.handleForward)
+	router.Methods("POST").Path("/v1/recordings").HandlerFunc(a.handlePostRecording)
 	router.Methods("GET").Path("/").Handler(a.Authenticate(http.HandlerFunc(a.handleGetIndex)))
 	router.Methods("GET").Path("/events").Handler(a.Authenticate(http.HandlerFunc(a.handleGetEvents)))
 	router.Methods("GET").Path("/events/{id}").Handler(a.Authenticate(http.HandlerFunc(a.handleGetEvent)))
@@ -68,6 +67,7 @@ func (a *api) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	router.Methods("POST").Path("/codes").Handler(a.Authenticate(http.HandlerFunc(a.handlePostCodes)))
 	router.Methods("POST").Path("/codes/{id}").Handler(a.Authenticate(http.HandlerFunc(a.handleDeleteCodes)))
 	router.Methods("GET").Path("/recordings").Handler(a.Authenticate(http.HandlerFunc(a.handleGetRecordings)))
+	router.Methods("GET").Path("/recordings/{id}").Handler(a.Authenticate(http.HandlerFunc(a.handleGetRecording)))
 
 	// Serve the request.
 	router.ServeHTTP(w, r)
@@ -89,7 +89,7 @@ func (a *api) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch kind {
 	case eventKindAdminIndex:
 	case eventKindAdminListCodes, eventKindAdminListEvents, eventKindAdminListRecordings:
-	case eventKindAdminGetEvent, eventKindAdminGetRecording:
+	case eventKindAdminGetEvent:
 		// Don't log these ones.
 	default:
 		a.EventLog.logEvent(kind, data)
@@ -140,7 +140,7 @@ func (a *api) handleForward(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?> 
 		<Response> 
 			<Say>%s</Say>
-			<Dial record="record-from-ringing" recordingStatusCallback="/v1/recordings" recordingStatusCallbackMethod="GET">
+			<Dial record="record-from-ringing" recordingStatusCallback="/v1/recordings" recordingStatusCallbackMethod="POST">
 				<Number>%s</Number>
 			</Dial>
 			<Say>%s</Say>
@@ -187,29 +187,46 @@ func (a *api) handlePostRecording(w http.ResponseWriter, r *http.Request) {
 
 func (a *api) handleGetRecordings(w http.ResponseWriter, r *http.Request) {
 	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
-	if name := r.FormValue("name"); name == "" {
-		dc.addData(dataKeyKind, string(eventKindAdminListRecordings))
-		buf, err := json.MarshalIndent(a.RecordingManager.listRecordings(), "", "    ")
-		if err != nil {
-			http.Error(w, errors.Wrap(err, "marshaling list of recordings").Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Write(buf)
-		return
-	} else {
-		dc.addData(
-			dataKeyKind, string(eventKindAdminGetRecording),
-			dataKeyRecordingName, name,
-		)
-		r, err := a.RecordingManager.getRecording(name)
-		if err != nil {
-			http.Error(w, errors.Wrap(err, "fetching recording").Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "audio/wav")
-		io.Copy(w, r)
+	dc.addData(dataKeyKind, string(eventKindAdminListRecordings))
+
+	recordings := a.RecordingManager.listRecordings()
+
+	aggregate := headerTemplate + recordingsTemplate + footerTemplate
+	if err := template.Must(template.New("recordings").Parse(aggregate)).Execute(w, struct {
+		Recordings []string
+	}{
+		Recordings: recordings,
+	}); err != nil {
+		http.Error(w, errors.Wrap(err, "executing recordings template").Error(), http.StatusInternalServerError)
 		return
 	}
+}
+
+func (a *api) handleGetRecording(w http.ResponseWriter, r *http.Request) {
+	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
+	dc.addData(dataKeyKind, string(eventKindAdminGetRecording))
+
+	id, ok := mux.Vars(r)["id"]
+	if !ok {
+		http.Error(w, "recording ID not provided", http.StatusBadRequest)
+		return
+	}
+
+	rec, err := a.RecordingManager.getRecording(id)
+	if err != nil {
+		http.Error(w, errors.Wrap(err, "fetching recording").Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Transfer-Encoding", "chunked")
+	w.Header().Set("Content-Type", "audio/wav")
+	n, err := io.Copy(w, rec)
+	if err != nil {
+		http.Error(w, errors.Wrap(err, "streaming recording to user").Error(), http.StatusInternalServerError)
+		return
+	}
+
+	dc.addData("Stream recording byte count", fmt.Sprint(n))
 }
 
 func (a *api) handleGetIndex(w http.ResponseWriter, r *http.Request) {

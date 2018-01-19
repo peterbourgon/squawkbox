@@ -57,5 +57,5 @@ func (rm *recordingManager) getRecording(name string) (io.Reader, error) {
 	if !ok {
 		return nil, errors.New("not found")
 	}
-	return buf, nil
+	return bytes.NewReader(buf.Bytes()), nil
 }
