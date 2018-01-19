@@ -11,447 +11,491 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/gorilla/mux"
+	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 )
 
-type api struct {
-	EventLog         *eventLog
-	Authenticate     func(http.Handler) http.Handler
-	GreetingText     string
-	ForwardText      string
-	ForwardNumber    string
-	NoResponseText   string
-	CodeManager      *codeManager
-	RecordingManager *recordingManager
+func loggingMiddleware(logger log.Logger) func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var (
+				begin = time.Now()
+				iw    = &interceptingWriter{http.StatusOK, w}
+			)
+			next.ServeHTTP(iw, r)
+			level.Info(logger).Log(
+				"method", r.Method,
+				"uri", r.RequestURI,
+				"content_length", r.ContentLength,
+				"status_code", iw.code,
+				"took", time.Since(begin),
+			)
+		})
+	}
 }
 
-func (a *api) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Set up initial values.
+func auditingMiddleware(log *auditLog) func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var (
+				begin = time.Now()
+				e     = newAuditEvent(r)
+				ctx   = context.WithValue(r.Context(), auditEventKey, e)
+				rr    = r.WithContext(ctx)
+				iw    = &interceptingWriter{http.StatusOK, w}
+			)
+			next.ServeHTTP(iw, rr)
+			e.finalize(time.Since(begin), iw.code)
+			log.logEvent(e)
+		})
+	}
+}
+
+type eventLogger interface{ logEvent(*auditEvent) }
+
+const auditEventKey = "audit_event"
+
+func setAuditEvent(ctx context.Context, k auditEventKind) *auditEvent {
+	e := ctx.Value(auditEventKey).(*auditEvent)
+	e.setKind(k)
+	return e
+}
+
+//
+//
+//
+
+func registerDoorbellRoutes(
+	router *mux.Router,
+	cm *codeManager,
+	greetingText string,
+	forwardText string,
+	forwardNumber string,
+	noResponseText string,
+	rm *recordingManager,
+) {
 	var (
-		begin = time.Now()
-		iw    = &interceptingWriter{code: http.StatusOK, ResponseWriter: w}
+		greeting  = handleGreeting(greetingText)
+		forward   = handleForward(forwardText, forwardNumber, noResponseText)
+		bypass    = handleBypass(cm, forward)
+		recording = handleRecording(rm)
 	)
-	w = iw
-
-	// Each request has base event data.
-	data := eventData{}
-	data.addData(
-		"HTTP RemoteAddr", r.RemoteAddr,
-		"HTTP Method", r.Method,
-		"HTTP URI", r.URL.RequestURI(),
-		"HTTP ContentLength", fmt.Sprint(r.ContentLength),
-	)
-	for k, vs := range r.Header {
-		data.addData("HTTP Header "+k, strings.Join(vs, ", "))
-	}
-
-	// Handlers will add to that event data.
-	var (
-		reqctx = r.Context()
-		newctx = context.WithValue(reqctx, dataCollectorContextKey, data)
-	)
-	r = r.WithContext(newctx)
-
-	// Build the route muxer.
-	router := mux.NewRouter()
-	router.StrictSlash(true)
-	router.Methods("POST").Path("/v1/greeting").HandlerFunc(a.handleGreeting)
-	router.Methods("POST").Path("/v1/bypass").HandlerFunc(a.handleBypass)
-	router.Methods("POST").Path("/v1/forward").HandlerFunc(a.handleForward)
-	router.Methods("POST").Path("/v1/recordings").HandlerFunc(a.handlePostRecording)
-	router.Methods("GET").Path("/").Handler(a.Authenticate(http.HandlerFunc(a.handleGetIndex)))
-	router.Methods("GET").Path("/events").Handler(a.Authenticate(http.HandlerFunc(a.handleGetEvents)))
-	router.Methods("GET").Path("/events/{id}").Handler(a.Authenticate(http.HandlerFunc(a.handleGetEvent)))
-	router.Methods("GET").Path("/codes").Handler(a.Authenticate(http.HandlerFunc(a.handleGetCodes)))
-	router.Methods("POST").Path("/codes").Handler(a.Authenticate(http.HandlerFunc(a.handlePostCodes)))
-	router.Methods("POST").Path("/codes/{id}").Handler(a.Authenticate(http.HandlerFunc(a.handleDeleteCodes)))
-	router.Methods("GET").Path("/recordings").Handler(a.Authenticate(http.HandlerFunc(a.handleGetRecordings)))
-	router.Methods("GET").Path("/recordings/{id}").Handler(a.Authenticate(http.HandlerFunc(a.handleGetRecording)))
-
-	// Serve the request.
-	router.ServeHTTP(w, r)
-
-	// Add final event data.
-	data.addData(
-		"HTTP Request Duration", time.Since(begin).String(),
-		"HTTP Status Code", fmt.Sprint(iw.code)+" "+http.StatusText(iw.code),
-	)
-
-	// Extract the Kind.
-	kind := eventKind(data[dataKeyKind])
-	if kind == "" {
-		kind = eventKindGenericHTTPRequest
-	}
-	delete(data, dataKeyKind)
-
-	// Log the event.
-	switch kind {
-	case eventKindAdminIndex:
-	case eventKindAdminListCodes, eventKindAdminListEvents, eventKindAdminListRecordings:
-	case eventKindAdminGetEvent, eventKindAdminGetRecording:
-		// Don't log these ones.
-	default:
-		a.EventLog.logEvent(kind, data)
-	}
+	router.Methods("POST").Path("/v1/greeting").Handler(greeting)
+	router.Methods("POST").Path("/v1/forward").Handler(forward)
+	router.Methods("POST").Path("/v1/bypass").Handler(bypass)
+	router.Methods("POST").Path("/v1/recordings").Handler(recording)
 }
 
-func (a *api) handleGreeting(w http.ResponseWriter, r *http.Request) {
-	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
-	dc.addData(dataKeyKind, string(eventKindDoorbellGreeting))
+func handleGreeting(greetingText string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setAuditEvent(r.Context(), doorbellGreeting)
 
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?> 
-		<Response> 
-			<Gather input="dtmf" action="/v1/bypass" timeout="5" finishOnKey="#">
-				<Say>%s</Say>
-			</Gather>
-			<Redirect>/v1/forward</Redirect>
-		</Response>
-	`, a.GreetingText)
-}
-
-func (a *api) handleBypass(w http.ResponseWriter, r *http.Request) {
-	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
-	dc.addData(dataKeyKind, string(eventKindDoorbellBypass))
-
-	r.ParseForm()
-	digits := r.FormValue("Digits")
-	dc.addData(dataKeyBypassAttemptWith, digits)
-
-	if digits != "" && a.CodeManager.checkCode(digits) == nil {
-		dc.addData(dataKeyBypassResult, dataValueSuccess)
 		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?> 
 			<Response> 
-				<Play digits="w9w"></Play>
+				<Gather input="dtmf" action="/v1/bypass" timeout="5" finishOnKey="#">
+					<Say>%s</Say>
+				</Gather>
+				<Redirect>/v1/forward</Redirect>
+			</Response>
+	`, greetingText)
+	})
+}
+
+func handleForward(forwardText, forwardNumber, noResponseText string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setAuditEvent(r.Context(), doorbellForward)
+
+		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?> 
+			<Response> 
+				<Say>%s</Say>
+				<Dial record="record-from-ringing" recordingStatusCallback="/v1/recordings" recordingStatusCallbackMethod="POST">
+					<Number>%s</Number>
+				</Dial>
+				<Say>%s</Say>
 				<Hangup />
 			</Response>
-		`)
-		return
-	}
-
-	dc.addData(dataKeyBypassResult, dataValueFailed)
-	a.handleForward(w, r)
+		`, forwardText, forwardNumber, noResponseText)
+	})
 }
 
-func (a *api) handleForward(w http.ResponseWriter, r *http.Request) {
-	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
-	dc.addData(dataKeyKind, string(eventKindDoorbellForward))
+func handleBypass(m *codeManager, forward http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		e := setAuditEvent(r.Context(), doorbellBypass)
 
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?> 
-		<Response> 
-			<Say>%s</Say>
-			<Dial record="record-from-ringing" recordingStatusCallback="/v1/recordings" recordingStatusCallbackMethod="POST">
-				<Number>%s</Number>
-			</Dial>
-			<Say>%s</Say>
-			<Hangup />
-		</Response>
-	`, a.ForwardText, a.ForwardNumber, a.NoResponseText)
-}
+		r.ParseForm()
+		digits := r.FormValue("Digits")
+		e.eventLogf("Bypass attempt with '%s'", digits)
 
-func (a *api) handlePostRecording(w http.ResponseWriter, r *http.Request) {
-	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
-	dc.addData(dataKeyKind, string(eventKindDoorbellRecording))
-
-	r.ParseForm()
-	var (
-		url = r.FormValue("RecordingUrl")
-		sid = r.FormValue("RecordingSid")
-		dur = r.FormValue("RecordingDuration")
-	)
-	if url == "" || sid == "" || dur == "" {
-		dc.addData(
-			dataKeyRecordingSaveResult, dataValueFailed,
-			dataKeyRecordingFailReason, "missing data",
-		)
-		http.NotFound(w, r)
-		return
-	}
-
-	var (
-		date = time.Now().Format("2006-01-02-15-04-05")
-		name = date + "-" + dur + "sec" + "-" + sid + ".wav"
-	)
-	if err := a.RecordingManager.saveRecording(name, url); err != nil {
-		dc.addData(
-			dataKeyRecordingSaveResult, dataValueFailed,
-			dataKeyRecordingFailReason, err.Error(),
-		)
-		http.Error(w, errors.Wrap(err, "saving recording").Error(), http.StatusInternalServerError)
-		return
-	}
-
-	dc.addData(dataKeyRecordingSaveResult, dataValueSuccess)
-	fmt.Fprintf(w, "Saved %s OK\n", name)
-}
-
-func (a *api) handleGetRecordings(w http.ResponseWriter, r *http.Request) {
-	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
-	dc.addData(dataKeyKind, string(eventKindAdminListRecordings))
-
-	recordings := a.RecordingManager.listRecordings()
-
-	aggregate := headerTemplate + recordingsTemplate + footerTemplate
-	if err := template.Must(template.New("recordings").Parse(aggregate)).Execute(w, struct {
-		Recordings []string
-	}{
-		Recordings: recordings,
-	}); err != nil {
-		http.Error(w, errors.Wrap(err, "executing recordings template").Error(), http.StatusInternalServerError)
-		return
-	}
-}
-
-func (a *api) handleGetRecording(w http.ResponseWriter, r *http.Request) {
-	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
-	dc.addData(dataKeyKind, string(eventKindAdminGetRecording))
-
-	id, ok := mux.Vars(r)["id"]
-	if !ok {
-		http.Error(w, "recording ID not provided", http.StatusBadRequest)
-		return
-	}
-
-	rec, err := a.RecordingManager.getRecording(id)
-	if err != nil {
-		http.Error(w, errors.Wrap(err, "fetching recording").Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Transfer-Encoding", "chunked")
-	w.Header().Set("Content-Type", "audio/wav")
-	n, err := io.Copy(w, rec)
-	if err != nil {
-		http.Error(w, errors.Wrap(err, "streaming recording to user").Error(), http.StatusInternalServerError)
-		return
-	}
-
-	dc.addData("Stream recording byte count", fmt.Sprint(n))
-}
-
-func (a *api) handleGetIndex(w http.ResponseWriter, r *http.Request) {
-	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
-	dc.addData(dataKeyKind, string(eventKindAdminIndex))
-
-	http.Redirect(w, r, "/events", http.StatusTemporaryRedirect)
-}
-
-func (a *api) handleGetEvents(w http.ResponseWriter, r *http.Request) {
-	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
-	dc.addData(dataKeyKind, string(eventKindAdminListEvents))
-
-	r.ParseForm()
-	var (
-		from     = r.FormValue("from")
-		countStr = r.FormValue("count")
-		count, _ = strconv.Atoi(countStr)
-	)
-
-	events, err := a.EventLog.listEvents(from, count)
-	if err != nil {
-		http.Error(w, errors.Wrap(err, "couldn't list events").Error(), http.StatusInternalServerError)
-		return
-	}
-
-	type templateEvent struct {
-		Color   string
-		ULID    string
-		Time    string
-		Kind    string
-		Details []string
-	}
-
-	templateEvents := make([]templateEvent, len(events))
-	for i, event := range events {
-		generalDetails, _ := parseDetails(event.Data)
-		templateEvents[i] = templateEvent{
-			Color:   colorFor(event.Kind),
-			ULID:    event.ULID,
-			Time:    event.HumanTime,
-			Kind:    string(event.Kind),
-			Details: generalDetails,
-		}
-	}
-
-	var nextPage string
-	if len(templateEvents) > 0 {
-		nextPage = templateEvents[len(templateEvents)-1].ULID
-	}
-
-	aggregate := headerTemplate + eventsTemplate + footerTemplate
-	if err := template.Must(template.New("events").Parse(aggregate)).Execute(w, struct {
-		Events   []templateEvent
-		NextPage string
-	}{
-		Events:   templateEvents,
-		NextPage: nextPage,
-	}); err != nil {
-		http.Error(w, errors.Wrap(err, "executing events template").Error(), http.StatusInternalServerError)
-		return
-	}
-}
-
-func (a *api) handleGetEvent(w http.ResponseWriter, r *http.Request) {
-	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
-	dc.addData(dataKeyKind, string(eventKindAdminGetEvent))
-
-	id := mux.Vars(r)["id"]
-	if id == "" {
-		http.Error(w, "no event ID provided; bad routing", http.StatusInternalServerError)
-		return
-	}
-
-	ev, err := a.EventLog.getEvent(id)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-
-	generalDetails, httpDetails := parseDetails(ev.Data)
-
-	aggregate := headerTemplate + eventTemplate + footerTemplate
-	if err := template.Must(template.New("event").Parse(aggregate)).Execute(w, struct {
-		Color   string
-		ULID    string
-		Time    string
-		UTC     string
-		Kind    string
-		Details []string
-		HTTP    []string
-	}{
-		Color:   colorFor(ev.Kind),
-		ULID:    ev.ULID,
-		Time:    ev.HumanTime,
-		UTC:     ev.Timestamp,
-		Kind:    string(ev.Kind),
-		Details: generalDetails,
-		HTTP:    httpDetails,
-	}); err != nil {
-		http.Error(w, errors.Wrap(err, "executing event template").Error(), http.StatusInternalServerError)
-		return
-	}
-}
-
-func (a *api) handleGetCodes(w http.ResponseWriter, r *http.Request) {
-	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
-	dc.addData(dataKeyKind, string(eventKindAdminListCodes))
-
-	codes, err := a.CodeManager.listCodes()
-	if err != nil {
-		http.Error(w, errors.Wrap(err, "listing codes").Error(), http.StatusInternalServerError)
-		return
-	}
-
-	flat := make([]bypassCode, 0, len(codes))
-	for _, code := range codes {
-		if t, err := time.Parse(time.RFC3339, code.ExpiresAt); err == nil {
-			code.ExpiresAt = t.Format(myDate) // for display
-		}
-		flat = append(flat, code)
-	}
-
-	aggregate := headerTemplate + codesTemplate + footerTemplate
-	if err := template.Must(template.New("event").Parse(aggregate)).Execute(w, struct {
-		Codes []bypassCode
-	}{
-		Codes: flat,
-	}); err != nil {
-		http.Error(w, errors.Wrap(err, "executing codes template").Error(), http.StatusInternalServerError)
-		return
-	}
-}
-
-func (a *api) handlePostCodes(w http.ResponseWriter, r *http.Request) {
-	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
-	dc.addData(dataKeyKind, string(eventKindAdminCreateCode))
-
-	r.ParseForm()
-	var (
-		code         = r.FormValue("code")
-		useCountStr  = r.FormValue("use_count")
-		expiresIn    = r.FormValue("expires_in")
-		expiresAtStr = r.FormValue("expires_at")
-	)
-	if code == "" {
-		http.Error(w, "code not specified", http.StatusBadRequest)
-		return
-	}
-	if !isNumeric(code) {
-		http.Error(w, "code is non-numeric", http.StatusBadRequest)
-		return
-	}
-
-	var expiresAt time.Time
-	if expiresIn != "" {
-		d, err := time.ParseDuration(expiresIn)
-		if err != nil {
-			http.Error(w, "expires_in is invalid", http.StatusBadRequest)
+		if digits != "" && m.checkCode(digits) == nil {
+			e.eventLog("Bypass SUCCESS")
+			fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?> 
+				<Response> 
+					<Play digits="w9w"></Play>
+					<Hangup />
+				</Response>
+			`)
 			return
 		}
-		expiresAt = time.Now().Add(d)
-	}
-	if expiresAtStr != "" {
-		t, err := time.Parse(time.RFC3339, expiresAtStr)
-		if err != nil {
-			http.Error(w, "expires_at is invalid", http.StatusBadRequest)
+
+		e.eventLog("Bypass FAILED, rerouting to forward")
+		forward.ServeHTTP(w, r)
+	})
+}
+
+func handleRecording(m *recordingManager) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		e := setAuditEvent(r.Context(), doorbellRecording)
+
+		r.ParseForm()
+		var (
+			url = r.FormValue("RecordingUrl")
+			sid = r.FormValue("RecordingSid")
+			dur = r.FormValue("RecordingDuration")
+		)
+
+		if url == "" || sid == "" || dur == "" {
+			e.eventLog("Recording request was missing data; not saved")
+			http.NotFound(w, r)
 			return
 		}
-		expiresAt = t
-	}
-	if expiresAt.IsZero() {
-		http.Error(w, "either expires_in or expires_at must be specified", http.StatusBadRequest)
-		return
-	}
 
-	useCount, err := strconv.Atoi(useCountStr)
-	if err != nil {
-		http.Error(w, errors.Wrap(err, "parsing use_count as integer").Error(), http.StatusBadRequest)
-		return
-	}
-	if useCount <= 0 {
-		http.Error(w, "use_count must be > 0", http.StatusBadRequest)
-		return
-	}
-	if err := a.CodeManager.addCode(code, useCount, expiresAt); err != nil {
-		http.Error(w, errors.Wrap(err, "adding code").Error(), http.StatusInternalServerError)
-		return
-	}
+		var (
+			date = time.Now().Format("2006-01-02-15-04-05")
+			name = date + "-" + dur + "sec" + "-" + sid + ".wav"
+		)
+		if err := m.saveRecording(name, url); err != nil {
+			e.eventLogf("Recording save failed: %v", err)
+			http.Error(w, errors.Wrap(err, "saving recording").Error(), http.StatusInternalServerError)
+			return
+		}
 
-	expiring := expiresAt.Format(time.RFC3339)
-	dc.addData(
-		dataKeyBypassCode, code,
-		dataKeyBypassCodeUseCount, fmt.Sprint(useCount),
-		dataKeyBypassCodeExpiresAt, expiring,
-	)
-
-	r.Method = "GET"
-	http.Redirect(w, r, "/codes", http.StatusSeeOther)
+		e.eventLog("Recording saved successfully")
+		fmt.Fprintf(w, "Saved %s OK\n", name)
+	})
 }
 
-func (a *api) handleDeleteCodes(w http.ResponseWriter, r *http.Request) {
-	dc := r.Context().Value(dataCollectorContextKey).(eventDataCollector)
-	dc.addData(dataKeyKind, string(eventKindAdminRevokeCode))
+//
+//
+//
 
-	r.ParseForm()
-	if r.FormValue("delete") == "" {
-		http.Error(w, "POST code without delete param", http.StatusBadRequest)
-		return
+func authMiddleware(realm, user, pass string) func(next http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requser, reqpass, _ := r.BasicAuth()
+			if requser != user || reqpass != pass {
+				w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, realm))
+				w.WriteHeader(http.StatusUnauthorized)
+				fmt.Fprintln(w, http.StatusText(http.StatusUnauthorized))
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
 	}
-
-	code := mux.Vars(r)["id"]
-	if code == "" {
-		http.Error(w, "code not specified", http.StatusBadRequest)
-		return
-	}
-	if err := a.CodeManager.revokeCode(code); err != nil {
-		http.Error(w, errors.Wrap(err, "revoking code").Error(), http.StatusBadRequest)
-		return
-	}
-	dc.addData(dataKeyBypassCode, code)
-
-	r.Method = "GET"
-	http.Redirect(w, r, "/codes", http.StatusSeeOther)
 }
+
+func registerAdminRoutes(
+	router *mux.Router,
+	basicAuthRealm, basicAuthUser, basicAuthPass string,
+	log *auditLog,
+	cm *codeManager,
+	rm *recordingManager,
+) {
+	auth := authMiddleware(basicAuthRealm, basicAuthUser, basicAuthPass)
+	router.Methods("GET").Path("/").Handler(auth(handleIndex()))
+	router.Methods("GET").Path("/events").Handler(auth(handleGetEvents(log)))
+	router.Methods("GET").Path("/events/{id}").Handler(auth(handleGetEvent(log)))
+	router.Methods("GET").Path("/codes").Handler(auth(handleGetCodes(cm)))
+	router.Methods("POST").Path("/codes").Handler(auth(handlePostCode(cm)))
+	router.Methods("POST").Path("/codes/{id}").Handler(auth(handleDeleteCode(cm)))
+	router.Methods("GET").Path("/recordings").Handler(auth(handleGetRecordings(rm)))
+	router.Methods("GET").Path("/recordings/{id}").Handler(auth(handleGetRecording(rm)))
+}
+
+func handleIndex() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/events", http.StatusTemporaryRedirect)
+	})
+}
+
+func handleGetEvents(log *auditLog) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setAuditEvent(r.Context(), adminGetEvents)
+
+		r.ParseForm()
+		var (
+			from     = r.FormValue("from")
+			countStr = r.FormValue("count")
+			count, _ = strconv.Atoi(countStr)
+		)
+		if count == 0 {
+			count = 100
+		}
+
+		events, err := log.getEvents(from, count)
+		if err != nil {
+			http.Error(w, errors.Wrap(err, "couldn't list events").Error(), http.StatusInternalServerError)
+			return
+		}
+
+		type templateEvent struct {
+			Color   string
+			ULID    string
+			Time    string
+			Kind    string
+			Details []string
+		}
+
+		templateEvents := make([]templateEvent, len(events))
+		for i, event := range events {
+			templateEvents[i] = templateEvent{
+				Color:   string(event.Kind.Color),
+				ULID:    event.ID,
+				Time:    ulid2localtime(event.ID),
+				Kind:    event.Kind.Name,
+				Details: event.Details,
+			}
+		}
+
+		var nextPage string
+		if len(templateEvents) >= count {
+			nextPage = templateEvents[len(templateEvents)-1].ULID
+		}
+
+		aggregate := headerTemplate + eventsTemplate + footerTemplate
+		if err := template.Must(template.New("events").Parse(aggregate)).Execute(w, struct {
+			Events   []templateEvent
+			NextPage string
+		}{
+			Events:   templateEvents,
+			NextPage: nextPage,
+		}); err != nil {
+			http.Error(w, errors.Wrap(err, "executing events template").Error(), http.StatusInternalServerError)
+			return
+		}
+	})
+}
+
+func handleGetEvent(log *auditLog) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setAuditEvent(r.Context(), adminGetEvent)
+
+		id := mux.Vars(r)["id"]
+		if id == "" {
+			http.Error(w, "no event ID provided; bad routing", http.StatusInternalServerError)
+			return
+		}
+
+		e, err := log.getEvent(id)
+		if err != nil {
+			http.Error(w, errors.Wrap(err, "getting event").Error(), http.StatusNotFound)
+			return
+		}
+
+		var httpDetails []string
+		httpDetails = append(httpDetails, fmt.Sprintf("%s %s", e.Request.Method, e.Request.URI))
+		for k, vs := range e.Request.Headers {
+			httpDetails = append(httpDetails, fmt.Sprintf("%s: %s", k, strings.Join(vs, ", ")))
+		}
+		sort.Strings(httpDetails)
+
+		aggregate := headerTemplate + eventTemplate + footerTemplate
+		if err := template.Must(template.New("event").Parse(aggregate)).Execute(w, struct {
+			Color   string
+			ULID    string
+			Time    string
+			UTC     string
+			Kind    string
+			Details []string
+			HTTP    []string
+		}{
+			Color:   string(e.Kind.Color),
+			ULID:    e.ID,
+			Time:    ulid2localtime(e.ID),
+			UTC:     ulid2utctime(e.ID),
+			Kind:    e.Kind.Name,
+			Details: e.Details,
+			HTTP:    httpDetails,
+		}); err != nil {
+			http.Error(w, errors.Wrap(err, "executing event template").Error(), http.StatusInternalServerError)
+			return
+		}
+	})
+}
+
+func handleGetCodes(cm *codeManager) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setAuditEvent(r.Context(), adminGetCodes)
+
+		codes, err := cm.listCodes()
+		if err != nil {
+			http.Error(w, errors.Wrap(err, "listing codes").Error(), http.StatusInternalServerError)
+			return
+		}
+
+		flat := make([]bypassCode, 0, len(codes))
+		for _, code := range codes {
+			if t, err := time.Parse(time.RFC3339, code.ExpiresAt); err == nil {
+				code.ExpiresAt = t.Format(myDate) // for display
+			}
+			flat = append(flat, code)
+		}
+
+		aggregate := headerTemplate + codesTemplate + footerTemplate
+		if err := template.Must(template.New("event").Parse(aggregate)).Execute(w, struct {
+			Codes []bypassCode
+		}{
+			Codes: flat,
+		}); err != nil {
+			http.Error(w, errors.Wrap(err, "executing codes template").Error(), http.StatusInternalServerError)
+			return
+		}
+	})
+}
+
+func handlePostCode(cm *codeManager) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		e := setAuditEvent(r.Context(), adminCreateCode)
+
+		r.ParseForm()
+		var (
+			code         = r.FormValue("code")
+			useCountStr  = r.FormValue("use_count")
+			expiresIn    = r.FormValue("expires_in")
+			expiresAtStr = r.FormValue("expires_at")
+		)
+		if code == "" {
+			http.Error(w, "code not specified", http.StatusBadRequest)
+			return
+		}
+		if !isNumeric(code) {
+			http.Error(w, "code is non-numeric", http.StatusBadRequest)
+			return
+		}
+
+		var expiresAt time.Time
+		if expiresIn != "" {
+			d, err := time.ParseDuration(expiresIn)
+			if err != nil {
+				http.Error(w, "expires_in is invalid", http.StatusBadRequest)
+				return
+			}
+			expiresAt = time.Now().Add(d)
+		}
+		if expiresAtStr != "" {
+			t, err := time.Parse(time.RFC3339, expiresAtStr)
+			if err != nil {
+				http.Error(w, "expires_at is invalid", http.StatusBadRequest)
+				return
+			}
+			expiresAt = t
+		}
+		if expiresAt.IsZero() {
+			http.Error(w, "either expires_in or expires_at must be specified", http.StatusBadRequest)
+			return
+		}
+
+		useCount, err := strconv.Atoi(useCountStr)
+		if err != nil {
+			http.Error(w, errors.Wrap(err, "parsing use_count as integer").Error(), http.StatusBadRequest)
+			return
+		}
+		if useCount <= 0 {
+			http.Error(w, "use_count must be > 0", http.StatusBadRequest)
+			return
+		}
+		if err := cm.addCode(code, useCount, expiresAt); err != nil {
+			http.Error(w, errors.Wrap(err, "adding code").Error(), http.StatusInternalServerError)
+			return
+		}
+
+		expiring := expiresAt.Format(time.RFC3339)
+		e.eventLogf("Create bypass code '%s'", code)
+		e.eventLogf("Bypass code has %d use(s)", useCount)
+		e.eventLogf("Bypass code expires at %s", expiring)
+
+		r.Method = "GET"
+		http.Redirect(w, r, "/codes", http.StatusSeeOther)
+	})
+}
+
+func handleDeleteCode(cm *codeManager) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		e := setAuditEvent(r.Context(), adminRevokeCode)
+
+		r.ParseForm()
+		if r.FormValue("delete") == "" {
+			http.Error(w, "POST code without delete param", http.StatusBadRequest)
+			return
+		}
+
+		code := mux.Vars(r)["id"]
+		if code == "" {
+			http.Error(w, "code not specified", http.StatusBadRequest)
+			return
+		}
+		if err := cm.revokeCode(code); err != nil {
+			http.Error(w, errors.Wrap(err, "revoking code").Error(), http.StatusBadRequest)
+			return
+		}
+		e.eventLogf("Revoked bypass code '%s'", code)
+
+		r.Method = "GET"
+		http.Redirect(w, r, "/codes", http.StatusSeeOther)
+	})
+}
+
+func handleGetRecordings(rm *recordingManager) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setAuditEvent(r.Context(), adminGetRecordings)
+
+		recordings := rm.listRecordings()
+
+		aggregate := headerTemplate + recordingsTemplate + footerTemplate
+		if err := template.Must(template.New("recordings").Parse(aggregate)).Execute(w, struct {
+			Recordings []string
+		}{
+			Recordings: recordings,
+		}); err != nil {
+			http.Error(w, errors.Wrap(err, "executing recordings template").Error(), http.StatusInternalServerError)
+			return
+		}
+	})
+}
+
+func handleGetRecording(rm *recordingManager) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		e := setAuditEvent(r.Context(), adminGetRecording)
+
+		id, ok := mux.Vars(r)["id"]
+		if !ok {
+			http.Error(w, "recording ID not provided", http.StatusBadRequest)
+			return
+		}
+
+		rec, err := rm.getRecording(id)
+		if err != nil {
+			http.Error(w, errors.Wrap(err, "fetching recording").Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Transfer-Encoding", "chunked")
+		w.Header().Set("Content-Type", "audio/wav")
+		n, err := io.Copy(w, rec)
+		if err != nil {
+			http.Error(w, errors.Wrap(err, "streaming recording to user").Error(), http.StatusInternalServerError)
+			return
+		}
+
+		e.eventLogf("Streamed %dB to client", n)
+	})
+}
+
+//
+//
+//
 
 type interceptingWriter struct {
 	code int
@@ -461,18 +505,6 @@ type interceptingWriter struct {
 func (iw *interceptingWriter) WriteHeader(code int) {
 	iw.code = code
 	iw.ResponseWriter.WriteHeader(code)
-}
-
-var dataCollectorContextKey string = "data-collector"
-
-type eventDataCollector interface{ addData(keyvals ...string) }
-
-type eventData map[string]string
-
-func (ed eventData) addData(keyvals ...string) {
-	for i := 0; i < len(keyvals); i += 2 {
-		ed[keyvals[i]] = keyvals[i+1]
-	}
 }
 
 func isNumeric(s string) bool {
@@ -486,48 +518,32 @@ func isNumeric(s string) bool {
 	return true
 }
 
-var (
-	dataKeyKind                = "Kind"
-	dataKeyRecordingSaveResult = "Recording save result"
-	dataKeyRecordingFailReason = "Recording fail reason"
-	dataKeyRecordingName       = "Recording name"
-	dataKeyBypassAttemptWith   = "Bypass attempt with"
-	dataKeyBypassResult        = "Bypass result"
-	dataKeyBypassCode          = "Bypass code"
-	dataKeyBypassCodeUseCount  = "Bypass code use count"
-	dataKeyBypassCodeExpiresAt = "Bypass code expires at"
-
-	dataValueSuccess = "SUCCESS"
-	dataValueFailed  = "FAILED"
-)
-
-func colorFor(kind eventKind) string {
-	switch kind {
-	case eventKindAdminCreateCode, eventKindAdminRevokeCode, eventKindAdminGetRecording:
-		return "orange"
-	case eventKindDoorbellGreeting, eventKindDoorbellForward, eventKindDoorbellRecording:
-		return "lightblue"
-	case eventKindDoorbellBypass:
-		return "red"
-	default:
-		return "white"
+func ulid2localtime(id string) string {
+	u, err := ulid.Parse(id)
+	if err != nil {
+		return "(couldn't parse time from ID)"
 	}
+	var (
+		msec = u.Time()
+		sec  = msec / 1e3
+		nsec = (msec % 1e3) * 1e6
+		t    = time.Unix(int64(sec), int64(nsec))
+	)
+	return t.Format(myDate)
 }
 
-func parseDetails(data map[string]string) (general, http []string) {
-	for k, v := range data {
-		var (
-			httpPrefix = strings.HasPrefix(k, "HTTP ")
-			statusCode = k == "HTTP Status Code"
-		)
-		if httpPrefix {
-			http = append(http, fmt.Sprintf("%s: %s", strings.TrimPrefix(k, "HTTP "), v))
-		}
-		if !httpPrefix || statusCode {
-			general = append(general, fmt.Sprintf("%s: %s", k, v))
-		}
+func ulid2utctime(id string) string {
+	u, err := ulid.Parse(id)
+	if err != nil {
+		return "(couldn't parse time from ID)"
 	}
-	sort.Strings(general)
-	sort.Strings(http)
-	return general, http
+	var (
+		msec = u.Time()
+		sec  = msec / 1e3
+		nsec = (msec % 1e3) * 1e6
+		t    = time.Unix(int64(sec), int64(nsec))
+	)
+	return t.UTC().Format(time.RFC3339Nano)
 }
+
+const myDate = "Monday 02 Jan 2006 15:04:05 MST"

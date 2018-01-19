@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
+	"github.com/gorilla/mux"
 	"github.com/oklog/run"
 )
 
@@ -52,41 +52,23 @@ func main() {
 		logger = level.NewFilter(logger, loglevel)
 	}
 
-	var eventLog *eventLog
+	var auditLog *auditLog
 	{
 		var err error
-		entropy := rand.New(rand.NewSource(time.Now().UnixNano()))
-		eventLog, err = newEventLog(*eventsfile, entropy)
+		auditLog, err = newAuditLog(*eventsfile)
 		if err != nil {
 			level.Error(logger).Log("err", err)
 			os.Exit(1)
 		}
 	}
 
-	var authenticate func(http.Handler) http.Handler
+	var basicAuthRealm, basicAuthUser, basicAuthPass string
 	{
-		if *authfile != "" {
-			realm, user, pass, err := parseAuthFile(*authfile)
-			if err != nil {
-				level.Error(logger).Log("err", err)
-				os.Exit(1)
-			}
-			authenticate = func(next http.Handler) http.Handler {
-				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					requser, reqpass, _ := r.BasicAuth()
-					if requser != user || reqpass != pass {
-						w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, realm))
-						w.WriteHeader(http.StatusUnauthorized)
-						fmt.Fprintln(w, http.StatusText(http.StatusUnauthorized))
-						return
-					}
-					next.ServeHTTP(w, r)
-				})
-			}
-			level.Debug(logger).Log("basic_auth", "enabled")
-		} else {
-			authenticate = func(next http.Handler) http.Handler { return next }
-			level.Warn(logger).Log("basic_auth", "disabled")
+		var err error
+		basicAuthRealm, basicAuthUser, basicAuthPass, err = parseAuthFile(*authfile)
+		if err != nil {
+			level.Error(logger).Log("err", err)
+			os.Exit(1)
 		}
 	}
 
@@ -115,29 +97,31 @@ func main() {
 		recordingManager = newRecordingManager(*recordingsdir)
 	}
 
-	api := &api{
-		EventLog:         eventLog,
-		Authenticate:     authenticate,
-		GreetingText:     *greeting,
-		ForwardText:      *forward,
-		ForwardNumber:    forwardNumber,
-		NoResponseText:   *noResponse,
-		CodeManager:      codeManager,
-		RecordingManager: recordingManager,
+	var handler http.Handler
+	{
+		router := mux.NewRouter()
+		router.StrictSlash(true)
+		registerAdminRoutes(router, basicAuthRealm, basicAuthUser, basicAuthPass, auditLog, codeManager, recordingManager)
+		registerDoorbellRoutes(router, codeManager, *greeting, *forward, forwardNumber, *noResponse, recordingManager)
+
+		handler = router
+		handler = auditingMiddleware(auditLog)(handler)
+		handler = loggingMiddleware(logger)(handler)
 	}
 
-	server := http.Server{
-		Handler: api,
-	}
-
-	ln, err := net.Listen("tcp", *addr)
-	if err != nil {
-		level.Error(logger).Log("module", "main", "err", err)
-		os.Exit(1)
+	var ln net.Listener
+	{
+		var err error
+		ln, err = net.Listen("tcp", *addr)
+		if err != nil {
+			level.Error(logger).Log("module", "main", "err", err)
+			os.Exit(1)
+		}
 	}
 
 	var g run.Group
 	{
+		server := http.Server{Handler: handler}
 		g.Add(func() error {
 			level.Info(logger).Log("addr", *addr)
 			return server.Serve(ln)

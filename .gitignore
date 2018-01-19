@@ -1,4 +1,3 @@
-forward.dat
-auth.dat
+*.dat
 recordings/
 bypass-codes/
