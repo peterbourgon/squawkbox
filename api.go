@@ -54,7 +54,9 @@ func auditingMiddleware(log *auditLog) func(next http.Handler) http.Handler {
 	}
 }
 
-type eventLogger interface{ logEvent(*auditEvent) }
+type eventLogger interface {
+	logEvent(*auditEvent)
+}
 
 const auditEventKey = "audit_event"
 
@@ -64,37 +66,29 @@ func setAuditEvent(ctx context.Context, k auditEventKind) *auditEvent {
 	return e
 }
 
-//
-//
-//
-
 func registerDoorbellRoutes(
 	router *mux.Router,
-	cm *codeManager,
-	greetingText string,
 	forwardText string,
 	forwardNumber string,
 	noResponseText string,
 	rm *recordingManager,
 ) {
 	var (
-		greeting  = handleGreeting(greetingText)
+		greeting  = handleGreeting()
 		forward   = handleForward(forwardText, forwardNumber, noResponseText)
-		bypass    = handleBypass(cm, forward)
 		recording = handleRecording(rm)
 	)
 	router.Methods("POST").Path("/v1/greeting").Handler(greeting)
 	router.Methods("POST").Path("/v1/forward").Handler(forward)
-	router.Methods("POST").Path("/v1/bypass").Handler(bypass)
 	router.Methods("POST").Path("/v1/recordings").Handler(recording)
 }
 
-func handleGreeting(greetingText string) http.Handler {
+func handleGreeting() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		setAuditEvent(r.Context(), doorbellGreeting)
 
-		fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?> 
-			<Response> 
+		fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+			<Response>
 				<Redirect>/v1/forward</Redirect>
 			</Response>
 	`)
@@ -105,8 +99,8 @@ func handleForward(forwardText, forwardNumber, noResponseText string) http.Handl
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		setAuditEvent(r.Context(), doorbellForward)
 
-		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?> 
-			<Response> 
+		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
+			<Response>
 				<Say>%s</Say>
 				<Dial record="record-from-ringing" recordingStatusCallback="/v1/recordings" recordingStatusCallbackMethod="POST">
 					<Number>%s</Number>
@@ -115,30 +109,6 @@ func handleForward(forwardText, forwardNumber, noResponseText string) http.Handl
 				<Hangup />
 			</Response>
 		`, forwardText, forwardNumber, noResponseText)
-	})
-}
-
-func handleBypass(m *codeManager, forward http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		e := setAuditEvent(r.Context(), doorbellBypass)
-
-		r.ParseForm()
-		digits := r.FormValue("Digits")
-		e.eventLogf("Bypass attempt with '%s'", digits)
-
-		if digits != "" && m.checkCode(digits) == nil {
-			e.eventLog("Bypass SUCCESS")
-			fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?> 
-				<Response> 
-					<Play digits="w9w"></Play>
-					<Hangup />
-				</Response>
-			`)
-			return
-		}
-
-		e.eventLog("Bypass FAILED, rerouting to forward")
-		forward.ServeHTTP(w, r)
 	})
 }
 
@@ -197,16 +167,12 @@ func registerAdminRoutes(
 	router *mux.Router,
 	basicAuthRealm, basicAuthUser, basicAuthPass string,
 	log *auditLog,
-	cm *codeManager,
 	rm *recordingManager,
 ) {
 	auth := authMiddleware(basicAuthRealm, basicAuthUser, basicAuthPass)
 	router.Methods("GET").Path("/").Handler(auth(handleIndex()))
 	router.Methods("GET").Path("/events").Handler(auth(handleGetEvents(log)))
 	router.Methods("GET").Path("/events/{id}").Handler(auth(handleGetEvent(log)))
-	router.Methods("GET").Path("/codes").Handler(auth(handleGetCodes(cm)))
-	router.Methods("POST").Path("/codes").Handler(auth(handlePostCode(cm)))
-	router.Methods("POST").Path("/codes/{id}").Handler(auth(handleDeleteCode(cm)))
 	router.Methods("GET").Path("/recordings").Handler(auth(handleGetRecordings(rm)))
 	router.Methods("GET").Path("/recordings/{id}").Handler(auth(handleGetRecording(rm)))
 }
@@ -319,128 +285,6 @@ func handleGetEvent(log *auditLog) http.Handler {
 			http.Error(w, errors.Wrap(err, "executing event template").Error(), http.StatusInternalServerError)
 			return
 		}
-	})
-}
-
-func handleGetCodes(cm *codeManager) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		setAuditEvent(r.Context(), adminGetCodes)
-
-		codes, err := cm.listCodes()
-		if err != nil {
-			http.Error(w, errors.Wrap(err, "listing codes").Error(), http.StatusInternalServerError)
-			return
-		}
-
-		flat := make([]bypassCode, 0, len(codes))
-		for _, code := range codes {
-			if t, err := time.Parse(time.RFC3339, code.ExpiresAt); err == nil {
-				code.ExpiresAt = t.Format(myDate) // for display
-			}
-			flat = append(flat, code)
-		}
-
-		aggregate := headerTemplate + codesTemplate + footerTemplate
-		if err := template.Must(template.New("event").Parse(aggregate)).Execute(w, struct {
-			Codes []bypassCode
-		}{
-			Codes: flat,
-		}); err != nil {
-			http.Error(w, errors.Wrap(err, "executing codes template").Error(), http.StatusInternalServerError)
-			return
-		}
-	})
-}
-
-func handlePostCode(cm *codeManager) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		e := setAuditEvent(r.Context(), adminCreateCode)
-
-		r.ParseForm()
-		var (
-			code         = r.FormValue("code")
-			useCountStr  = r.FormValue("use_count")
-			expiresIn    = r.FormValue("expires_in")
-			expiresAtStr = r.FormValue("expires_at")
-		)
-		if code == "" {
-			http.Error(w, "code not specified", http.StatusBadRequest)
-			return
-		}
-		if !isNumeric(code) {
-			http.Error(w, "code is non-numeric", http.StatusBadRequest)
-			return
-		}
-
-		var expiresAt time.Time
-		if expiresIn != "" {
-			d, err := time.ParseDuration(expiresIn)
-			if err != nil {
-				http.Error(w, "expires_in is invalid", http.StatusBadRequest)
-				return
-			}
-			expiresAt = time.Now().Add(d)
-		}
-		if expiresAtStr != "" {
-			t, err := time.Parse(time.RFC3339, expiresAtStr)
-			if err != nil {
-				http.Error(w, "expires_at is invalid", http.StatusBadRequest)
-				return
-			}
-			expiresAt = t
-		}
-		if expiresAt.IsZero() {
-			http.Error(w, "either expires_in or expires_at must be specified", http.StatusBadRequest)
-			return
-		}
-
-		useCount, err := strconv.Atoi(useCountStr)
-		if err != nil {
-			http.Error(w, errors.Wrap(err, "parsing use_count as integer").Error(), http.StatusBadRequest)
-			return
-		}
-		if useCount <= 0 {
-			http.Error(w, "use_count must be > 0", http.StatusBadRequest)
-			return
-		}
-		if err := cm.addCode(code, useCount, expiresAt); err != nil {
-			http.Error(w, errors.Wrap(err, "adding code").Error(), http.StatusInternalServerError)
-			return
-		}
-
-		expiring := expiresAt.Format(time.RFC3339)
-		e.eventLogf("Create bypass code '%s'", code)
-		e.eventLogf("Bypass code has %d use(s)", useCount)
-		e.eventLogf("Bypass code expires at %s", expiring)
-
-		r.Method = "GET"
-		http.Redirect(w, r, "/codes", http.StatusSeeOther)
-	})
-}
-
-func handleDeleteCode(cm *codeManager) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		e := setAuditEvent(r.Context(), adminRevokeCode)
-
-		r.ParseForm()
-		if r.FormValue("delete") == "" {
-			http.Error(w, "POST code without delete param", http.StatusBadRequest)
-			return
-		}
-
-		code := mux.Vars(r)["id"]
-		if code == "" {
-			http.Error(w, "code not specified", http.StatusBadRequest)
-			return
-		}
-		if err := cm.revokeCode(code); err != nil {
-			http.Error(w, errors.Wrap(err, "revoking code").Error(), http.StatusBadRequest)
-			return
-		}
-		e.eventLogf("Revoked bypass code '%s'", code)
-
-		r.Method = "GET"
-		http.Redirect(w, r, "/codes", http.StatusSeeOther)
 	})
 }
 
