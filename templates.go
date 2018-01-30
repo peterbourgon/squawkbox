@@ -16,7 +16,6 @@ td, th {
 <div class="header">
 <strong>Squawkbox</strong> •
 <a href="/events">Audit log</a> ·
-<a href="/codes">Bypass codes</a> ·
 <a href="/recordings">Recordings</a>
 </div>
 <br/>`
@@ -69,47 +68,6 @@ const eventTemplate = `
   	</li>
 </ul>
 `
-
-const codesTemplate = `
-<form action="/codes" method="POST">
-	Code <input type="text" name="code" size=10 />
-	Use count <input type="text" name="use_count" size=5 value="1" />
-	Expires in <select name="expires_in">
-		<option value="5m">5 minutes</option>
-		<option value="1h" selected>1 hour</option>
-		<option value="4h">4 hours</option>
-		<option value="12h">12 hours</option>
-		<option value="24h">1 day</option>
-		<option value="48h">2 days</option>
-		<option value="72h">3 days</option>
-		<option value="168h">1 week</option>
-	</select>
-	<input type="submit" value="Create"/>
-</form>
-
-<table>
-<tr>
-	<th>Bypass code</th>
-	<th>Use count</th>
-	<th>Expires at</th>
-	<th>Revoke</th>
-</tr>
-{{ if .Codes }}{{ range .Codes }}
-<tr>
-	<td>{{ .Code }}</td>
-	<td>{{ .UseCount }}</td>
-	<td>{{ .ExpiresAt }}</td>
-	<td><form action="/codes/{{ .Code }}" method="POST"><input type="hidden" name="delete" value="true" /><input type="submit" value="Revoke"/></form></td>
-</tr>
-{{ end }}{{ else }}
-<tr>
-	<td>(No bypass codes!)</td>
-	<td></td>
-	<td></td>
-	<td></td>
-</tr>
-{{ end }}
-</table>`
 
 const recordingsTemplate = `<ul>
 {{ if .Recordings }}{{ range .Recordings }}

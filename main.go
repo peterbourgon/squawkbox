@@ -23,10 +23,8 @@ func main() {
 		debug         = fs.Bool("debug", false, "debug logging")
 		authfile      = fs.String("authfile", "", "file containing HTTP BasicAuth user:pass:realm")
 		forwardfile   = fs.String("forwardfile", "", "file containing number to forward to")
-		greeting      = fs.String("greeting", "Hello; enter code, or wait for connection.", "greeting text")
 		forward       = fs.String("forward", "Connecting you now.", "forward text")
 		noResponse    = fs.String("noresponse", "Nobody picked up. Goodbye!", "no response text")
-		codesfile     = fs.String("codesfile", "codes.dat", "file to store bypass codes")
 		eventsfile    = fs.String("eventsfile", "events.dat", "file to store event log")
 		recordingsdir = fs.String("recordingsdir", "", "directory containing saved recordings")
 	)
@@ -81,17 +79,6 @@ func main() {
 			os.Exit(1)
 		}
 	}
-
-	var codeManager *codeManager
-	{
-		var err error
-		codeManager, err = newCodeManager(*codesfile)
-		if err != nil {
-			level.Error(logger).Log("err", err)
-			os.Exit(1)
-		}
-	}
-
 	var recordingManager *recordingManager
 	{
 		recordingManager = newRecordingManager(*recordingsdir)
@@ -101,8 +88,8 @@ func main() {
 	{
 		router := mux.NewRouter()
 		router.StrictSlash(true)
-		registerAdminRoutes(router, basicAuthRealm, basicAuthUser, basicAuthPass, auditLog, codeManager, recordingManager)
-		registerDoorbellRoutes(router, codeManager, *greeting, *forward, forwardNumber, *noResponse, recordingManager)
+		registerAdminRoutes(router, basicAuthRealm, basicAuthUser, basicAuthPass, auditLog, recordingManager)
+		registerDoorbellRoutes(router, *forward, forwardNumber, *noResponse, recordingManager)
 
 		handler = router
 		handler = auditingMiddleware(auditLog)(handler)

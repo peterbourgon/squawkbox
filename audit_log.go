@@ -63,9 +63,6 @@ var (
 	adminIndex         = auditEventKind{"Admin index", white, false}
 	adminGetEvents     = auditEventKind{"Admin get events", white, false}
 	adminGetEvent      = auditEventKind{"Admin get event", white, false}
-	adminGetCodes      = auditEventKind{"Admin get codes", white, false}
-	adminCreateCode    = auditEventKind{"Admin create code", orange, true}
-	adminRevokeCode    = auditEventKind{"Admin revoke code", orange, true}
 	adminGetRecordings = auditEventKind{"Admin get recordings", white, false}
 	adminGetRecording  = auditEventKind{"Admin get recording", white, false}
 	genericHTTPRequest = auditEventKind{"Generic HTTP request", gray, true}
