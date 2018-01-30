@@ -93,14 +93,11 @@ func handleGreeting(greetingText string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		setAuditEvent(r.Context(), doorbellGreeting)
 
-		fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?> 
+		fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?> 
 			<Response> 
-				<Gather input="dtmf" action="/v1/bypass" timeout="5" finishOnKey="#">
-					<Say>%s</Say>
-				</Gather>
 				<Redirect>/v1/forward</Redirect>
 			</Response>
-	`, greetingText)
+	`)
 	})
 }
 
